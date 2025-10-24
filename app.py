@@ -1,13 +1,22 @@
 from flask import Flask, request, jsonify, make_response
 from pymongo import MongoClient
 from bson import ObjectId
+from dotenv import load_dotenv
+import certifi
+import os
 
 app = Flask(__name__)
 
-# MongoDB Connection
-client = MongoClient("mongodb://127.0.0.1:27017")
-db = client.gameDB
+# Load environment variables
+load_dotenv()
+
+# Connect to MongoDB Atlas
+uri = os.getenv("MONGODB_URI")
+client = MongoClient(uri, tlsCAFile=certifi.where())
+db = client.GameVaultDB
 games = db.games
+
+
 
 # --------------------------------------------------------------------------------
 # GET ALL GAMES
