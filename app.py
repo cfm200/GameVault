@@ -24,19 +24,31 @@ games = db.games
 
 @app.route("/api/v1.0/games", methods=["GET"])
 def show_all_games():
-    page_num, page_size = 1, 10
-    if request.args.get('pn'):
-        page_num = int(request.args.get('pn'))
-    if request.args.get('ps'):
-        page_size = int(request.args.get('ps'))
+    # Read query params (string initially)
+    page_num = request.args.get("pn", 1)
+    page_size = request.args.get("ps", 10)
+
+    # Validate pagination values
+    try:
+        page_num = int(page_num)
+        page_size = int(page_size)
+        if page_num < 1 or page_size < 1:
+            return make_response(jsonify({"error": "Page number and page size must be positive integers"}), 400)
+    except ValueError:
+        return make_response(jsonify({"error": "Page number and Page size must be integers"}), 400)
+
+    # Perform pagination
     page_start = (page_size * (page_num - 1))
     data_to_return = []
+
     for game in games.find().skip(page_start).limit(page_size):
         game["_id"] = str(game["_id"])
         for review in game["reviews"]:
             review["_id"] = str(review["_id"])
         data_to_return.append(game)
+
     return make_response(jsonify(data_to_return), 200)
+
 
 
 
@@ -180,40 +192,44 @@ def delete_game(id):
 @app.route("/api/v1.0/games/<string:id>/reviews", methods=["GET"])
 def fetch_all_reviews(id):
 
-    # Validate ObjectId format before attempting to use it
+    # Validate ObjectId format
     if not ObjectId.is_valid(id):
         return make_response(jsonify({"error": "Invalid Game ID format"}), 400)
-    
-    data_to_return = []
-    
-    # Find the game and retrieve only the reviews field
+
+    # Pagination parameters and validation
+    page_num = request.args.get("pn", 1)
+    page_size = request.args.get("ps", 10)
+
+    try:
+        page_num = int(page_num)
+        page_size = int(page_size)
+        if page_num < 1 or page_size < 1:
+            return make_response(jsonify({"error": "Page number and page size must be positive integers"}), 400)
+    except ValueError:
+        return make_response(jsonify({"error": "Page number and page size must be integers"}), 400)
+
+    # Calculate skip
+    page_start = (page_size * (page_num - 1))
+
+    # Retrieve game with reviews field only
     game = games.find_one({"_id": ObjectId(id)}, {"reviews": 1, "_id": 0})
-    
-    # Check if game exists
+
     if not game:
         return make_response(jsonify({"error": "Invalid Game ID"}), 404)
-    
-    # Check if game has reviews
+
     if "reviews" not in game or len(game["reviews"]) == 0:
         return make_response(jsonify({"error": "No reviews found"}), 404)
-    
-    # Convert ObjectId to string for JSON serialization
+
+    # Convert ObjectId and apply pagination
+    reviews = []
     for review in game["reviews"]:
-        if "_id" in review:
-            review["_id"] = str(review["_id"])
-        data_to_return.append(review)
-    
-    # Get pagination parameters from query string (default: page 1, 10 items per page)
-    page_num = int(request.args.get("pn", 1))
-    page_size = int(request.args.get("ps", 10))
-    
-    # Calculate the starting index for pagination
-    page_start = (page_size * (page_num - 1))
-    
-    # Get the paginated subset of reviews
-    paginated_reviews = data_to_return[page_start : page_start + page_size]
-    
+        review["_id"] = str(review["_id"])
+        reviews.append(review)
+
+    paginated_reviews = reviews[page_start:page_start + page_size]
+
     return make_response(jsonify(paginated_reviews), 200)
+
 
 
 
@@ -412,6 +428,103 @@ def delete_review(g_id, r_id):
     except Exception as e:
         # Handle any unexpected runtime errors
         return make_response(jsonify({"error": f"Server error: {str(e)}"}), 500)
+
+
+
+# --------------------------------------------------------------------------------
+# GET AWARD LEADERBOARD
+# --------------------------------------------------------------------------------
+
+@app.route("/api/v1.0/games/award-leaderboard", methods=["GET"])
+def get_award_leaderboard():
+
+    # Pagination parameters and validation
+    try:
+        page_num = int(request.args.get("pn", 1))
+        page_size = int(request.args.get("ps", 10))
+        if page_num < 1 or page_size < 1:
+            return make_response(jsonify({"error": "Page number and page size must be positive integers"}), 400)
+    except ValueError:
+        return make_response(jsonify({"error": "Page number and page size must be integers"}), 400)
+
+    skip_amount = page_size * (page_num - 1)
+
+    pipeline = [
+        {"$unwind": "$awards"},
+        {"$group": {
+            "_id": {"id": "$_id", "title": "$title"},
+            "award_count": {"$sum": 1}
+        }},
+        {"$sort": {"award_count": -1}},
+        {"$skip": skip_amount},
+        {"$limit": page_size},
+        {"$project": {
+            "_id": 0,
+            "id": {"$toString": "$_id.id"},
+            "title": "$_id.title",
+            "award_count": 1
+        }}
+    ]
+
+    results = list(games.aggregate(pipeline))
+    return make_response(jsonify(results), 200)
+
+
+# --------------------------------------------------------------------------------
+# GET CLOSEST DEV HQ
+# --------------------------------------------------------------------------------
+
+@app.route("/api/v1.0/games/closest", methods=["GET"])
+def closest_game_studio():
+    try:
+        lng = float(request.args.get("lng"))
+        lat = float(request.args.get("lat"))
+        radius = float(request.args.get("radius", 50000))  # default 50 km
+    except (TypeError, ValueError):
+        return make_response(jsonify({"error": "lng, lat, and radius must be numbers"}), 400)
+
+    user_location = {
+        "type": "Point",
+        "coordinates": [lng, lat]
+    }
+
+    # First Query: Search within radius
+    nearby = games.find_one({
+        "developer_hq": {
+            "$near": {
+                "$geometry": user_location,
+                "$maxDistance": radius
+            }
+        }
+    })
+
+    if nearby:
+        nearby["_id"] = str(nearby["_id"])
+        return make_response(jsonify({
+            "message": "Nearest game studio(s) in your area",
+            "result": nearby
+        }), 200)
+
+    # Second Query: No match within radius, return closest overall
+    fallback = games.find_one({
+        "developer_hq": {
+            "$near": {
+                "$geometry": user_location
+            }
+        }
+    })
+
+    if fallback:
+        fallback["_id"] = str(fallback["_id"])
+        return make_response(jsonify({
+            "message": "No developer HQ found within your radius, but here is the closest",
+            "result": fallback
+        }), 200)
+
+    # Final fallback: no spatial data in DB
+    return make_response(jsonify({"error": "No games in database have developer location data"}), 404)
+
+
 
 
 if __name__ == "__main__":
