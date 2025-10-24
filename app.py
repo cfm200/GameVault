@@ -474,55 +474,90 @@ def get_award_leaderboard():
 # GET CLOSEST DEV HQ
 # --------------------------------------------------------------------------------
 
+from math import radians
+
 @app.route("/api/v1.0/games/closest", methods=["GET"])
 def closest_game_studio():
     try:
         lng = float(request.args.get("lng"))
         lat = float(request.args.get("lat"))
-        radius = float(request.args.get("radius", 50000))  # default 50 km
+        radius = float(request.args.get("radius", 50000))  # meters
+        limit = int(request.args.get("limit", 5))  # number of results to return
     except (TypeError, ValueError):
-        return make_response(jsonify({"error": "lng, lat, and radius must be numbers"}), 400)
+        return make_response(jsonify({"error": "lng, lat, radius, and limit must be numbers"}), 400)
 
-    user_location = {
-        "type": "Point",
-        "coordinates": [lng, lat]
-    }
-
-    # First Query: Search within radius
-    nearby = games.find_one({
-        "developer_hq": {
-            "$near": {
-                "$geometry": user_location,
-                "$maxDistance": radius
+    pipeline = [
+        {
+            "$geoNear": {
+                "near": {
+                    "type": "Point",
+                    "coordinates": [lng, lat]
+                },
+                "distanceField": "distance",
+                "spherical": True,
+                "maxDistance": radius
             }
-        }
-    })
+        },
+        {
+            "$project": {
+                "_id": {"$toString": "$_id"},
+                "title": 1,
+                "developer": 1,
+                "distance": 1
+            }
+        },
+        { "$limit": limit }
+    ]
 
-    if nearby:
-        nearby["_id"] = str(nearby["_id"])
+    results = list(games.aggregate(pipeline))
+
+    if len(results) > 0:
+        for doc in results:
+            doc["distance_km"] = round(doc["distance"] / 1000, 2)
+            del doc["distance"]
         return make_response(jsonify({
-            "message": "Nearest game studio(s) in your area",
-            "result": nearby
+            "message": "Nearest game studios",
+            "count": len(results),
+            "results": results
         }), 200)
 
-    # Second Query: No match within radius, return closest overall
-    fallback = games.find_one({
-        "developer_hq": {
-            "$near": {
-                "$geometry": user_location
+    # Fallback: closest overall if none within radius
+    fallback_pipeline = [
+        {
+            "$geoNear": {
+                "near": {
+                    "type": "Point",
+                    "coordinates": [lng, lat]
+                },
+                "distanceField": "distance",
+                "spherical": True
             }
-        }
-    })
+        },
+        {
+            "$project": {
+                "_id": {"$toString": "$_id"},
+                "title": 1,
+                "developer": 1,
+                "distance": 1
+            }
+        },
+        { "$limit": 1 }
+    ]
 
-    if fallback:
-        fallback["_id"] = str(fallback["_id"])
+    fallback = list(games.aggregate(fallback_pipeline))
+
+    if len(fallback) > 0:
+        closest = fallback[0]
+        closest["distance_km"] = round(closest["distance"] / 1000, 2)
+        del closest["distance"]
         return make_response(jsonify({
-            "message": "No developer HQ found within your radius, but here is the closest",
-            "result": fallback
+            "message": "No nearby developer headquarters found, showing the closest one instead",
+            "result": closest
         }), 200)
 
-    # Final fallback: no spatial data in DB
+    # No geospatial data in DB at all
     return make_response(jsonify({"error": "No games in database have developer location data"}), 404)
+
 
 
 
