@@ -1,9 +1,14 @@
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, g
 from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
+from functools import wraps
 import certifi
 import os
+import jwt
+import datetime
+import bcrypt
+
 
 app = Flask(__name__)
 
@@ -15,6 +20,141 @@ uri = os.getenv("MONGODB_URI")
 client = MongoClient(uri, tlsCAFile=certifi.where())
 db = client.GameVaultDB
 games = db.games
+users = db.users
+blacklist = db.blacklist
+
+app.config['SECRET_KEY'] = os.getenv("JWT_SECRET", "GameVaultSecretKey")
+
+from flask import g
+
+def decode_token_from_header():
+    token = request.headers.get("x-access-token")
+    if not token:
+        return None, {"error": "Token missing"}, 401
+
+    if blacklist.find_one({"token": token}):
+        return None, {"error": "Token has been blacklisted"}, 401
+
+    try:
+        data = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+        return data, None, None
+    except jwt.ExpiredSignatureError:
+        return None, {"error": "Token expired"}, 401
+    except jwt.InvalidTokenError:
+        return None, {"error": "Invalid token"}, 401
+
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        payload, error, code = decode_token_from_header()
+        if error:
+            return make_response(jsonify(error), code)
+        g.user = {
+            "user_id": payload.get("user_id"),
+            "username": payload.get("username"),
+            "admin": payload.get("admin", False)
+        }
+        return f(*args, **kwargs)
+    return decorated
+
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        payload, error, code = decode_token_from_header()
+        if error:
+            return make_response(jsonify(error), code)
+        if not payload.get("admin", False):
+            return make_response(jsonify({"error": "Admin privileges required"}), 403)
+        g.user = {
+            "user_id": payload.get("user_id"),
+            "username": payload.get("username"),
+            "admin": True
+        }
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route("/api/v1.0/register", methods=["POST"])
+def register():
+    data = request.get_json()
+
+    if not data or not data.get("username") or not data.get("password"):
+        return make_response(jsonify({"error": "Username and password are required"}), 400)
+
+    username = data["username"]
+    password = data["password"].encode("utf-8")
+
+    # Check if username already exists
+    if users.find_one({"username": username}):
+        return make_response(jsonify({"error": "Username already exists"}), 409)
+
+    # Hash password
+    hashed = bcrypt.hashpw(password, bcrypt.gensalt())
+
+    new_user = {
+        "username": username,
+        "password": hashed,
+        "admin": False
+    }
+
+    users.insert_one(new_user)
+    return make_response(jsonify({"message": "User registered successfully"}), 201)
+
+
+@app.route("/api/v1.0/login", methods=["POST"])
+def login():
+    # Try Basic Auth first
+    auth = request.authorization
+    if auth and auth.username and auth.password:
+        user = users.find_one({"username": auth.username})
+        if user and bcrypt.checkpw(auth.password.encode("utf-8"), user["password"]):
+            token = jwt.encode({
+                "user_id": str(user["_id"]),
+                "username": user["username"],
+                "admin": user.get("admin", False),
+                "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+            }, app.config["SECRET_KEY"], algorithm="HS256")
+            return jsonify({"token": token})
+
+        return make_response(jsonify({"error": "Invalid credentials"}), 401)
+
+    # If not Basic Auth, fallback to JSON body
+    data = request.get_json()
+    if not data or not data.get("username") or not data.get("password"):
+        return make_response(jsonify({"error": "Username and password required"}), 400)
+
+    user = users.find_one({"username": data["username"]})
+    if not user or not bcrypt.checkpw(data["password"].encode("utf-8"), user["password"]):
+        return make_response(jsonify({"error": "Invalid credentials"}), 401)
+
+    token = jwt.encode({
+        "user_id": str(user["_id"]),
+        "username": user["username"],
+        "admin": user.get("admin", False),
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+    }, app.config["SECRET_KEY"], algorithm="HS256")
+
+    return jsonify({"token": token})
+
+
+@app.route("/api/v1.0/logout", methods=["POST"])
+@token_required
+def logout():
+    token = request.headers.get("x-access-token")
+
+    if blacklist.find_one({"token": token}):
+        return make_response(jsonify({"message": "Token already blacklisted"}), 400)
+
+    blacklist.insert_one({"token": token})
+    return make_response(jsonify({"message": "Successfully logged out"}), 200)
+
+
+# @app.route("/api/v1.0/protected-test", methods=["GET"])
+# @token_required
+# def protected_test():
+#     return jsonify({"message": f"Hello {g.user['username']}"}), 200
 
 
 
@@ -79,45 +219,58 @@ def show_one_game(id):
 # --------------------------------------------------------------------------------
 
 @app.route("/api/v1.0/games", methods=["POST"])
+@admin_required
 def add_new_game():
-    # Check if required fields are present
-    if 'title' in request.form and \
-        'platforms' in request.form and \
-        'release_year' in request.form and \
-        'developer' in request.form and \
-        'publisher' in request.form and \
-        'esrb' in request.form and \
-        'genres' in request.form and \
-        'modes' in request.form:
 
-        # Check if title already exists
-        title = request.form['title']
-        existing_game = games.find_one({'title' : title})
+    if not request.is_json:
+        return make_response(jsonify({"error": "Request must be JSON"}), 400)
 
-        if existing_game:
-            return make_response(jsonify({'error' : 'A game already exists with that title'}), 409)
-        
-        new_game = {
-            'title' : request.form['title'],
-            'platforms' : request.form.getlist('platforms'),
-            'release_year' : request.form['release_year'],
-            'developer' : request.form['developer'],
-            'publisher' : request.form['publisher'],
-            'esrb' : request.form['esrb'],
-            'genres' : request.form.getlist('genres'),
-            'modes' : request.form.getlist('modes'),
-            'reviews' : []
+    data = request.get_json()
 
-        }
+    required_fields = ["title", "platforms", "release_year", "developer", "publisher", "esrb", "genres", "modes"]
+    if not all(field in data for field in required_fields):
+        return make_response(jsonify({"error": "Missing required fields"}), 400)
 
-        # Add new game to collection
-        new_game_id = games.insert_one(new_game)
-        
-        # Return link for newly created game
-        new_game_link = "http://localhost:5000/api/v1.0/games/" + str(new_game_id.inserted_id)
-        return make_response(jsonify({'url':new_game_link}), 201)
-    else:
-        return make_response(jsonify({'error':'Missing form data'}), 404)
+    # Check for duplicate title
+    if games.find_one({"title": data["title"]}):
+        return make_response(jsonify({"error": "A game with that title already exists"}), 409)
+
+    new_game = {
+        "title": data["title"],
+        "platforms": data.get("platforms", []),
+        "release_year": data.get("release_year"),
+        "developer": data.get("developer"),
+        "publisher": data.get("publisher"),
+        "rating": data.get("rating", None),
+        "esrb": data.get("esrb"),
+        "genres": data.get("genres", []),
+        "modes": data.get("modes", []),
+        "reviews": [],
+        "awards": []
+    }
+
+    # Optional geospatial validation
+    hq = data.get("developer_hq")
+    if hq:
+        if (
+            isinstance(hq, dict)
+            and hq.get("type") == "Point"
+            and isinstance(hq.get("coordinates"), list)
+            and len(hq["coordinates"]) == 2
+            and isinstance(hq["coordinates"][0], (int, float))
+            and isinstance(hq["coordinates"][1], (int, float))
+        ):
+            new_game["developer_hq"] = hq
+        else:
+            return make_response(jsonify({"error": "Invalid GeoJSON format for developer_hq"}), 400)
+
+    inserted_id = games.insert_one(new_game).inserted_id
+
+    return make_response(jsonify({
+        "message": "Game added successfully",
+        "game_id": str(inserted_id)
+    }), 201)
+
 
 
 
@@ -126,42 +279,45 @@ def add_new_game():
 # --------------------------------------------------------------------------------
 
 @app.route("/api/v1.0/games/<string:id>", methods=["PUT"])
+@admin_required
 def edit_game(id):
 
-    # Validate ObjectId format
+    if not request.is_json:
+        return make_response(jsonify({"error": "Request must be JSON"}), 400)
+
     if not ObjectId.is_valid(id):
         return make_response(jsonify({"error": "Invalid Game ID format"}), 400)
 
-    # Define all expected fields
-    expected_fields = ['title', 'platforms', 'release_year', 'developer', 'publisher', 'esrb', 'genres', 'modes']
-    
-    # Check if at least one field is present
-    if not any(field in request.form for field in expected_fields):
-        return make_response(jsonify({"error": "No valid fields provided"}), 400)
-    
-    # Build update dictionary dynamically
-    update_data = {}
-    
-    # Handle list fields (using getlist)
-    list_fields = ['platforms', 'genres', 'modes']
-    for field in list_fields:
-        if field in request.form:
-            update_data[field] = request.form.getlist(field)
-    
-    # Handle regular string fields
-    string_fields = ['title', 'release_year', 'developer', 'publisher', 'esrb']
-    for field in string_fields:
-        if field in request.form:
-            update_data[field] = request.form[field]
-    
-    # Perform the update
-    result = games.update_one({"_id": ObjectId(id)}, {"$set": update_data})
-    
-    if result.matched_count == 1:
-        edited_game_link = "http://localhost:5000/api/v1.0/games/" + id
-        return make_response(jsonify({"url": edited_game_link}), 200)
-    else:
-        return make_response(jsonify({"error": "Invalid Game ID"}), 404)
+    data = request.get_json()
+
+    update_fields = {}
+
+    for field in ["title", "platforms", "release_year", "developer", "publisher", "esrb", "genres", "modes"]:
+        if field in data:
+            update_fields[field] = data[field]
+
+    if "developer_hq" in data:
+        hq = data["developer_hq"]
+        if (
+            isinstance(hq, dict)
+            and hq.get("type") == "Point"
+            and isinstance(hq.get("coordinates"), list)
+            and len(hq["coordinates"]) == 2
+        ):
+            update_fields["developer_hq"] = hq
+        else:
+            return make_response(jsonify({"error": "Invalid GeoJSON format"}), 400)
+
+    if not update_fields:
+        return make_response(jsonify({"error": "No valid update fields provided"}), 400)
+
+    result = games.update_one({"_id": ObjectId(id)}, {"$set": update_fields})
+
+    if result.modified_count == 1:
+        return make_response(jsonify({"message": "Game updated successfully"}), 200)
+
+    return make_response(jsonify({"error": "Game update failed"}), 500)
+
 
 
 
@@ -170,6 +326,7 @@ def edit_game(id):
 # --------------------------------------------------------------------------------
 
 @app.route("/api/v1.0/games/<string:id>", methods=["DELETE"])
+@admin_required
 def delete_game(id):
 
     # Validate ObjectId format
@@ -237,45 +394,44 @@ def fetch_all_reviews(id):
 # ADD NEW REVIEW FOR A GAME
 # --------------------------------------------------------------------------------
 
-@app.route("/api/v1.0/games/<string:id>/reviews", methods=["POST"])
-def add_new_review(id):
+@app.route("/api/v1.0/games/<string:g_id>/reviews", methods=["POST"])
+@token_required
+def add_new_review(g_id):
 
-    # Validate ObjectId format before attempting to use it
-    if not ObjectId.is_valid(id):
+    if not ObjectId.is_valid(g_id):
         return make_response(jsonify({"error": "Invalid Game ID format"}), 400)
-    
-    # Check if all required fields are present in the form data
-    if "username" in request.form and "comment" in request.form and "rating" in request.form:
-        # Validate rating is between 1 and 10
-        try:
-            rating = int(request.form["rating"])
-            if rating < 1 or rating > 10:
-                return make_response(jsonify({"error": "Rating must be between 1 and 10"}), 400)
-        except ValueError:
-            return make_response(jsonify({"error": "Rating must be a valid number"}), 400)
-        
-        # Create new review object with a unique ID
-        new_review = {
-            "_id": ObjectId(),
-            "username": request.form["username"],
-            "comment": request.form["comment"],
-            "rating": rating  # Use the validated integer value
-        }
-        
-        # Push the new review to the game's reviews array
-        result = games.update_one({"_id": ObjectId(id)}, {"$push": {"reviews": new_review}})
-        
-        # Check if a game was found and updated
-        if result.matched_count == 1:
-            # Build URL for the newly created review
-            new_review_link = "http://localhost:5000/api/v1.0/games/" + id + "/reviews/" + str(new_review["_id"])
-            return make_response(jsonify({"url": new_review_link}), 201)
-        else:
-            # Game ID was valid format but doesn't exist in database
-            return make_response(jsonify({"error": "Invalid Game ID"}), 404)
-    else:
-        # Required form fields are missing
-        return make_response(jsonify({"error": "Missing form data"}), 400)
+
+    if not request.is_json:
+        return make_response(jsonify({"error": "Request must be JSON"}), 400)
+
+    data = request.get_json()
+
+    if "comment" not in data or "rating" not in data:
+        return make_response(jsonify({"error": "Comment and rating are required"}), 400)
+
+    try:
+        rating = int(data["rating"])
+        if rating < 1 or rating > 10:
+            return make_response(jsonify({"error": "Rating must be between 1 and 10"}), 400)
+    except ValueError:
+        return make_response(jsonify({"error": "Rating must be a number"}), 400)
+
+    game = games.find_one({"_id": ObjectId(g_id)})
+    if not game:
+        return make_response(jsonify({"error": "Game not found"}), 404)
+
+    new_review = {
+        "_id": ObjectId(),
+        "user_id": g.user["user_id"],
+        "username": g.user["username"],
+        "comment": data["comment"],
+        "rating": rating
+    }
+
+    games.update_one({"_id": ObjectId(g_id)}, {"$push": {"reviews": new_review}})
+
+    return make_response(jsonify({"message": "Review added successfully"}), 201)
+
 
 
 
@@ -323,65 +479,51 @@ def fetch_one_review(g_id, r_id):
 # --------------------------------------------------------------------------------
 
 @app.route("/api/v1.0/games/<string:g_id>/reviews/<string:r_id>", methods=["PUT"])
+@token_required
 def edit_review(g_id, r_id):
 
-    # Validate game ID format
-    if not ObjectId.is_valid(g_id):
-        return make_response(jsonify({"error": "Invalid Game ID format"}), 400)
-    
-    # Validate review ID format
-    if not ObjectId.is_valid(r_id):
-        return make_response(jsonify({"error": "Invalid Review ID format"}), 400)
-    
-    # Check if at least one field is provided
-    if "username" not in request.form and "comment" not in request.form and "rating" not in request.form:
+    if not request.is_json:
+        return make_response(jsonify({"error": "Request must be JSON"}), 400)
+
+    if not ObjectId.is_valid(g_id) or not ObjectId.is_valid(r_id):
+        return make_response(jsonify({"error": "Invalid ID format"}), 400)
+
+    data = request.get_json()
+
+    game = games.find_one({"_id": ObjectId(g_id)}, {"reviews": 1})
+    if not game:
+        return make_response(jsonify({"error": "Game not found"}), 404)
+
+    review = next((r for r in game.get("reviews", []) if str(r["_id"]) == r_id), None)
+    if not review:
+        return make_response(jsonify({"error": "Review not found"}), 404)
+
+    # Ownership or admin
+    if not g.user["admin"] and review.get("user_id") != g.user["user_id"]:
+        return make_response(jsonify({"error": "Not authorized to edit this review"}), 403)
+
+    update_fields = {}
+
+    if "comment" in data:
+        update_fields["reviews.$.comment"] = data["comment"]
+
+    if "rating" in data:
+        try:
+            rating = int(data["rating"])
+            if rating < 1 or rating > 10:
+                return make_response(jsonify({"error": "Rating must be between 1 and 10"}), 400)
+            update_fields["reviews.$.rating"] = rating
+        except ValueError:
+            return make_response(jsonify({"error": "Rating must be a number"}), 400)
+
+    if not update_fields:
         return make_response(jsonify({"error": "No valid fields provided"}), 400)
-    
-    try:
-        # First check if the game exists
-        game = games.find_one({"_id": ObjectId(g_id)}, {"reviews": 1, "_id": 0})
-        
-        if game is None:
-            return make_response(jsonify({"error": "Invalid Game ID"}), 404)
-        
-        # Check if review exists in the game
-        review_exists = any(str(r["_id"]) == r_id for r in game.get("reviews", []))
-        
-        if not review_exists:
-            return make_response(jsonify({"error": "Invalid Review ID"}), 404)
-        
-        # Build the update dictionary dynamically
-        edited_review = {}
-        
-        if "username" in request.form:
-            edited_review["reviews.$.username"] = request.form["username"]
-        
-        if "comment" in request.form:
-            edited_review["reviews.$.comment"] = request.form["comment"]
-        
-        if "rating" in request.form:
-            # Validate rating is between 1 and 10
-            try:
-                rating = int(request.form["rating"])
-                if rating < 1 or rating > 10:
-                    return make_response(jsonify({"error": "Rating must be between 1 and 10"}), 400)
-                edited_review["reviews.$.rating"] = rating
-            except ValueError:
-                return make_response(jsonify({"error": "Rating must be a valid number"}), 400)
-        
-        # Update the review
-        result = games.update_one({"reviews._id": ObjectId(r_id)}, {"$set": edited_review})
-        
-        if result.modified_count == 1:
-            edit_review_url = "http://localhost:5000/api/v1.0/games/" + g_id + "/reviews/" + r_id
-            return make_response(jsonify({"url": edit_review_url}), 200)
-        else:
-            # This shouldn't happen since we already validated, but just in case
-            return make_response(jsonify({"error": "Review update failed"}), 500)
-    
-    except Exception as e:
-        # Handle any unexpected runtime errors
-        return make_response(jsonify({"error": f"Server error: {str(e)}"}), 500)
+
+    games.update_one({"_id": ObjectId(g_id), "reviews._id": ObjectId(r_id)}, {"$set": update_fields})
+
+    return make_response(jsonify({"message": "Review updated successfully"}), 200)
+
+
 
 
 
@@ -390,44 +532,33 @@ def edit_review(g_id, r_id):
 # --------------------------------------------------------------------------------
 
 @app.route("/api/v1.0/games/<string:g_id>/reviews/<string:r_id>", methods=["DELETE"])
+@token_required
 def delete_review(g_id, r_id):
+    if not ObjectId.is_valid(g_id) or not ObjectId.is_valid(r_id):
+        return make_response(jsonify({"error": "Invalid ID format"}), 400)
 
-    # Validate game ID format
-    if not ObjectId.is_valid(g_id):
-        return make_response(jsonify({"error": "Invalid Game ID format"}), 400)
-    
-    # Validate review ID format
-    if not ObjectId.is_valid(r_id):
-        return make_response(jsonify({"error": "Invalid Review ID format"}), 400)
-    
-    try:
-        # First check if the game exists
-        game = games.find_one({"_id": ObjectId(g_id)}, {"reviews": 1, "_id": 0})
-        
-        if game is None:
-            return make_response(jsonify({"error": "Invalid Game ID"}), 404)
-        
-        # Check if review exists in the game
-        review_exists = any(str(r["_id"]) == r_id for r in game.get("reviews", []))
-        
-        if not review_exists:
-            return make_response(jsonify({"error": "Invalid Review ID"}), 404)
-        
-        # Delete the review
-        result = games.update_one(
-            {"_id": ObjectId(g_id)}, 
-            {"$pull": {"reviews": {"_id": ObjectId(r_id)}}}
-        )
-        
-        if result.modified_count == 1:
-            return make_response(jsonify({}), 204)
-        else:
-            # This shouldn't happen since we already validated, but just in case
-            return make_response(jsonify({"error": "Review deletion failed"}), 500)
-    
-    except Exception as e:
-        # Handle any unexpected runtime errors
-        return make_response(jsonify({"error": f"Server error: {str(e)}"}), 500)
+    game = games.find_one({"_id": ObjectId(g_id)}, {"reviews": 1})
+    if not game:
+        return make_response(jsonify({"error": "Game not found"}), 404)
+
+    review = next((r for r in game.get("reviews", []) if str(r["_id"]) == r_id), None)
+
+    if not review:
+        return make_response(jsonify({"error": "Review not found"}), 404)
+
+    # Ownership enforcement
+    if not g.user["admin"] and review.get("user_id") != g.user["user_id"]:
+        return make_response(jsonify({"error": "Not authorized to delete this review"}), 403)
+
+    result = games.update_one(
+        {"_id": ObjectId(g_id)},
+        {"$pull": {"reviews": {"_id": ObjectId(r_id)}}}
+    )
+
+    if result.modified_count == 1:
+        return make_response(jsonify({"message": "Review deleted successfully"}), 200)
+
+    return make_response(jsonify({"error": "Delete failed"}), 500)
 
 
 
