@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, make_response, g
+from datetime import datetime, timedelta, timezone
 from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -114,7 +115,7 @@ def login():
                 "user_id": str(user["_id"]),
                 "username": user["username"],
                 "admin": user.get("admin", False),
-                "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+                "exp": datetime.now(timezone.utc) + timedelta(minutes=30)
             }, app.config["SECRET_KEY"], algorithm="HS256")
             return jsonify({"token": token})
 
