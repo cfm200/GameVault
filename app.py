@@ -615,7 +615,7 @@ def closest_game_studio():
         radius = float(request.args.get("radius", 50000))  # meters
         limit = int(request.args.get("limit", 5))  # number of results to return
     except (TypeError, ValueError):
-        return make_response(jsonify({"error": "lng, lat, radius, and limit must be numbers"}), 400)
+        return make_response(jsonify({"error": "Longitude, latitiude, radius, and limit must be numbers"}), 400)
 
     pipeline = [
         {
